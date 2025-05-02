@@ -7,6 +7,7 @@ import pytz
 import os
 import string
 import random
+import smtplib
 from werkzeug.utils import secure_filename
 from werkzeug.security import check_password_hash
 from werkzeug.security import generate_password_hash
@@ -14,8 +15,12 @@ from flask import session, redirect, url_for, render_template
 import logging
 import mariadb
 from flask import request, jsonify, session
-
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from utils import row_to_dict, rows_to_dict
+import sendgrid 
+from sendgrid.helpers.mail import Mail, Email, To, Content
+import requests
 
 app = Flask(__name__)
 app.secret_key = '77ddb26acf05b21b43c1f8cfda7062dc'  # wag i delete
@@ -23,9 +28,20 @@ app.secret_key = '77ddb26acf05b21b43c1f8cfda7062dc'  # wag i delete
 db_config = {
     'host': 'localhost',
     'user': 'root',
-    'password': 'sulasok_tv',
+    'password': 'loleris1234',
     'database': 'attendance_tracker',
 }
+
+app.config['MAIL_SERVER'] = 'smtp.gmail.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USERNAME'] = 'programmingproject06@gmail.com'
+app.config['MAIL_PASSWORD'] = 'udci zrfz hujo fzvz'
+app.config['SESSION_PROTECTION'] = 'strong'
+app.config['RECAPTCHA_SITE_KEY'] = '6Lf2PSsrAAAAAPLfqDdyUmF3GNEY8AFOC9aNyNe2'
+app.config['RECAPTCHA_SECRET_KEY'] = '6Lf2PSsrAAAAAHvsT2z1r2D46h3SRXvp_kj6zkvP'
+
+
 
 def get_db_connection():
     connection = pymysql.connect(
@@ -37,18 +53,54 @@ def get_db_connection():
     )
     return connection
 
+def generate_otp(length=6):
+    characters = string.digits  # Only digits for OTP
+    otp = ''.join(random.choice(characters) for i in range(length))
+    return otp
+
+def send_otp_email(user_email, otp):
+    # SendGrid API Key (replace with your own API key)
+    sg = sendgrid.SendGridAPIClient(api_key='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')
+
+    from_email = Email("programmingproject06@gmail.com")  # Your sender email (can be a verified domain email)
+    to_email = To(user_email)  # Receiver email
+    subject = "Your OTP Code"
+    content = Content("text/plain", f"Your OTP code is: {otp}")
+
+    mail = Mail(from_email, to_email, subject, content)
+
+    try:
+        response = sg.send(mail)
+        print(f"OTP sent successfully: {response.status_code}")
+    except Exception as e:
+        print(f"Failed to send OTP: {e}")
+
 @app.route("/")
 def index():
     return render_template("index.html")
 
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-       
+        # Step 1: Verify reCAPTCHA
+        recaptcha_response = request.form.get('g-recaptcha-response')
+        secret_key = app.config['RECAPTCHA_SECRET_KEY']
+        verify_url = "https://www.google.com/recaptcha/api/siteverify"
+        payload = {
+            'secret': secret_key,
+            'response': recaptcha_response
+        }
+        r = requests.post(verify_url, data=payload)
+        result = r.json()
+
+        if not result.get("success"):
+            return render_template("login.html", error="reCAPTCHA verification failed. Please try again.")
+
+        # Step 2: Handle login logic
         school_id = request.form['school_id']
         password = request.form['password']
 
-        
         connection = get_db_connection()
         cursor = connection.cursor()
         cursor.execute("SELECT * FROM users WHERE school_id = %s", (school_id,))
@@ -56,7 +108,6 @@ def login():
         connection.close()
 
         if user and check_password_hash(user['password'], password):
-           
             session['user_id'] = user['id']
             session['role'] = user['role']
 
@@ -67,10 +118,11 @@ def login():
             else:
                 return redirect(url_for('student_dashboard'))
         else:
-           
             return render_template("login.html", error="Invalid login credentials")
 
     return render_template("login.html")
+
+
 
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
@@ -81,72 +133,119 @@ def signup():
         confirm_password = request.form['confirm_password']
         email = request.form['email'] 
 
-        
         if password != confirm_password:
             return "Passwords do not match", 400
 
-        
         connection = get_db_connection()
         cursor = connection.cursor()
         cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
         existing_user = cursor.fetchone()
+        connection.close()
 
         if existing_user:
             return "Email is already registered. Please choose another one.", 400
 
-        
-        hashed_password = generate_password_hash(password)
+        # Store form fields in session temporarily
+        session['role'] = role
+        session['school_id'] = school_id
+        session['password'] = password
+        session['email'] = email
 
         if role == 'Student':
-            firstname = request.form['firstname']
-            lastname = request.form['lastname']
-            name = f"{firstname} {lastname}"
-        else:
-            name = request.form['name']
-
-        cursor.execute(
-            "INSERT INTO users (name, password, role, school_id, email) VALUES (%s, %s, %s, %s, %s)",
-            (name, hashed_password, role, school_id, email)
-        )
-        connection.commit()
-        user_id = cursor.lastrowid
-
-        image_dir = os.path.join('static', 'images')
-        if not os.path.exists(image_dir):
-            os.makedirs(image_dir)
-
-        if role == 'Student':
-            course = request.form['course']
-            track = request.form['track']
-            school_id_image_path = None
+            session['firstname'] = request.form['firstname']
+            session['lastname'] = request.form['lastname']
+            session['course'] = request.form['course']
+            session['track'] = request.form['track']
 
             if 'school_id_image' in request.files:
-                school_id_image = request.files['school_id_image']
-                filename = secure_filename(school_id_image.filename)
-                school_id_image_path = os.path.join(image_dir, filename)
-                school_id_image.save(school_id_image_path)
-
-            cursor.execute(""" 
-                INSERT INTO students (user_id, school_id, firstname, lastname, course, track, school_id_image) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (user_id, school_id, firstname, lastname, course, track, school_id_image_path))
-
+                image = request.files['school_id_image']
+                if image:
+                    filename = secure_filename(image.filename)
+                    image_path = os.path.join('static/images', filename)
+                    image.save(image_path)
+                    session['school_id_image_path'] = image_path
         elif role == 'Instructor':
-            instructor_id = request.form['instructor_id']
-            subject = request.form['subject']
-            cursor.execute(""" 
-                INSERT INTO instructors (user_id, instructor_id, subject, school_id) 
-                VALUES (%s, %s, %s, %s)
-            """, (user_id, instructor_id, subject, school_id))
-
+            session['name'] = request.form['name']
+            session['instructor_id'] = request.form['instructor_id']
+            session['subject'] = request.form['subject']
         elif role == 'Admin':
-            cursor.execute("INSERT INTO admins (user_id, school_id) VALUES (%s, %s)", (user_id, school_id))
+            session['name'] = request.form['name']
 
-        connection.commit()
-        connection.close()
-        return redirect(url_for('login'))
+        # Generate and send OTP
+        otp = generate_otp()
+        session['otp'] = otp
+        send_otp_email(email, otp)
+
+        return redirect(url_for('verify_otp'))
 
     return render_template("signup.html")
+
+
+@app.route("/verify_otp", methods=["GET", "POST"])
+def verify_otp():
+    if 'role' not in session:
+        return redirect(url_for('signup'))
+    if request.method == "POST":
+        user_otp = request.form["otp"]
+        if user_otp == session.get("otp"):
+            connection = get_db_connection()
+            cursor = connection.cursor()
+
+            email = session['email']
+            role = session['role']
+            school_id = session['school_id']
+            hashed_password = generate_password_hash(session['password'])
+
+            if role == 'Student':
+                firstname = session['firstname']
+                lastname = session['lastname']
+                name = f"{firstname} {lastname}"
+            else:
+                name = session['name']
+
+            cursor.execute(
+                "INSERT INTO users (name, password, role, school_id, email) VALUES (%s, %s, %s, %s, %s)",
+                (name, hashed_password, role, school_id, email)
+            )
+            connection.commit()
+            user_id = cursor.lastrowid
+
+            # Insert into role-specific tables
+            if role == 'Student':
+                course = session['course']
+                track = session['track']
+                image_path = session.get('school_id_image_path')
+
+                cursor.execute("""
+                    INSERT INTO students (user_id, school_id, firstname, lastname, course, track, school_id_image)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (user_id, school_id, firstname, lastname, course, track, image_path))
+
+            elif role == 'Instructor':
+                instructor_id = session['instructor_id']
+                subject = session['subject']
+
+                cursor.execute("""
+                    INSERT INTO instructors (user_id, instructor_id, subject, school_id)
+                    VALUES (%s, %s, %s, %s)
+                """, (user_id, instructor_id, subject, school_id))
+
+            elif role == 'Admin':
+                cursor.execute("INSERT INTO admins (user_id, school_id) VALUES (%s, %s)", (user_id, school_id))
+
+            connection.commit()
+            connection.close()
+
+            # Clear session data (optional but recommended)
+            session.clear()
+
+            return redirect(url_for('login'))
+        else:
+            return "Invalid OTP", 400
+
+    return render_template("verify_otp.html")
+
+    
 
 
 
